@@ -1,31 +1,41 @@
 import express from "express";
 import cors from "cors";
-import fs from "fs";
-import path from "path";
-import os from "os";
-import { execFile } from "child_process";
+import dotenv from "dotenv";
 import RunwayML, { TaskFailedError } from "@runwayml/sdk";
+import ffmpegPath from "ffmpeg-static";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import crypto from "crypto";
+import { execFile } from "child_process";
+import { promisify } from "util";
+
+dotenv.config();
 
 const app = express();
+const PORT = process.env.PORT || 10000;
 
 app.use(cors());
-app.use(express.json({ limit: "20mb" }));
+app.use(express.json({ limit: "1mb" }));
 
-const PORT = process.env.PORT || 10000;
-const RUNWAY_API_KEY = process.env.RUNWAYML_API_SECRET;
+const API_KEY = process.env.RUNWAYML_API_SECRET;
 
-if (!RUNWAY_API_KEY) {
-  console.error("ERROR: RUNWAYML_API_SECRET is missing");
-}
+const SCENE_COUNT = Number(process.env.SCENE_COUNT || 120);
+const CLIP_DURATION = 5;
 
-if (RUNWAY_API_KEY && !RUNWAY_API_KEY.startsWith("key_")) {
-  console.error("ERROR: Runway API key must start with key_");
-}
+const client = API_KEY
+  ? new RunwayML({
+      apiSecret: API_KEY
+    })
+  : null;
 
-const runway = new RunwayML({
-  apiKey: RUNWAY_API_KEY
-});
+const jobs = new Map();
 
+const execFileAsync = promisify(execFile);
+
+/*
+  HOME
+*/
 app.get("/", (req, res) => {
   res.json({
     status: "online",
@@ -34,89 +44,132 @@ app.get("/", (req, res) => {
   });
 });
 
-app.get("/health", (req, res) => {
+/*
+  HEALTH CHECK
+*/
+app.get("/api/health", (req, res) => {
   res.json({
-    ok: true,
-    runwayConfigured:
-      !!RUNWAY_API_KEY &&
-      RUNWAY_API_KEY.startsWith("key_")
+    success: true,
+    status: "online",
+    service: "VEOX AI",
+    runwayConfigured: Boolean(API_KEY),
+    sceneCount: SCENE_COUNT,
+    clipDuration: CLIP_DURATION
   });
 });
 
 /*
-  Generate ONE short clip.
-  The same character reference image is used
-  for every scene.
+  CREATE SCENE PROMPTS
 */
-async function generateClip({
-  prompt,
-  characterImage,
-  duration = 10,
-  ratio = "1280:720"
-}) {
-  const input = {
-    model: "gen4.5",
-    promptText: prompt,
-    ratio,
-    duration
-  };
+function createScenePrompts(story) {
+  const sentences = story
+    .split(/[.!?]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
 
-  if (characterImage) {
-    input.promptImage = characterImage;
+  const prompts = [];
+
+  for (let i = 0; i < SCENE_COUNT; i++) {
+    const part =
+      sentences[i % Math.max(sentences.length, 1)] || story;
+
+    prompts.push(
+      `Cinematic AI video scene based on this story moment: ${part}. ` +
+      `Beautiful coherent visual storytelling, natural movement, ` +
+      `cinematic camera motion, detailed environment, realistic lighting, ` +
+      `high quality film look. Do not add text, subtitles, logos or watermarks.`
+    );
   }
 
-  console.log("Generating clip...");
-
-  const task = await runway.imageToVideo
-    .create(input)
-    .waitForTaskOutput({
-      timeout: 10 * 60 * 1000
-    });
-
-  if (!task.output || !task.output[0]) {
-    throw new Error("Runway did not return a video URL");
-  }
-
-  return task.output[0];
+  return prompts;
 }
 
 /*
-  Download generated video.
+  DOWNLOAD VIDEO
 */
-async function downloadVideo(url, filename) {
+async function downloadVideo(url, filePath) {
   const response = await fetch(url);
 
   if (!response.ok) {
     throw new Error(
-      `Video download failed: ${response.status}`
+      `Failed to download generated video: ${response.status}`
     );
   }
 
-  const buffer = Buffer.from(await response.arrayBuffer());
+  const buffer = Buffer.from(
+    await response.arrayBuffer()
+  );
 
-  fs.writeFileSync(filename, buffer);
-
-  return filename;
+  await fs.promises.writeFile(filePath, buffer);
 }
 
 /*
-  Join all clips using FFmpeg.
+  GENERATE ONE CLIP
 */
-function mergeVideos(files, output) {
-  return new Promise((resolve, reject) => {
-    const listFile = path.join(
-      os.tmpdir(),
-      `veox-${Date.now()}.txt`
+async function generateClip(prompt, ratio, filePath) {
+  if (!client) {
+    throw new Error(
+      "RUNWAYML_API_SECRET is missing in Render Environment Variables."
     );
+  }
 
-    const content = files
-      .map(file => `file '${file.replace(/'/g, "'\\''")}'`)
-      .join("\n");
+  const task = client.imageToVideo.create({
+    model: "gen4.5",
+    promptText: prompt,
+    ratio: ratio,
+    duration: CLIP_DURATION
+  });
 
-    fs.writeFileSync(listFile, content);
+  const completedTask =
+    await task.waitForTaskOutput({
+      timeout: 15 * 60 * 1000
+    });
 
-    execFile(
-      "ffmpeg",
+  const videoUrl =
+    completedTask?.output?.[0];
+
+  if (!videoUrl) {
+    throw new Error(
+      "Runway completed the task but returned no video."
+    );
+  }
+
+  await downloadVideo(
+    videoUrl,
+    filePath
+  );
+
+  return filePath;
+}
+
+/*
+  MERGE VIDEOS
+*/
+async function mergeVideos(
+  videoFiles,
+  outputFile
+) {
+  const listFile = path.join(
+    os.tmpdir(),
+    `veox-list-${crypto.randomUUID()}.txt`
+  );
+
+  const content = videoFiles
+    .map(
+      (file) =>
+        `file '${path.resolve(file)}'`
+    )
+    .join("\n");
+
+  await fs.promises.writeFile(
+    listFile,
+    content,
+    "utf8"
+  );
+
+  try {
+    await execFileAsync(
+      ffmpegPath,
       [
         "-y",
         "-f",
@@ -125,176 +178,301 @@ function mergeVideos(files, output) {
         "0",
         "-i",
         listFile,
-        "-c",
-        "copy",
-        output
-      ],
-      (error, stdout, stderr) => {
-        fs.unlinkSync(listFile);
-
-        if (error) {
-          console.error(stderr);
-          reject(error);
-          return;
-        }
-
-        resolve(output);
-      }
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-an",
+        outputFile
+      ]
     );
-  });
+  } finally {
+    await fs.promises
+      .unlink(listFile)
+      .catch(() => {});
+  }
 }
 
 /*
-  10-minute video generator
-
-  10 minutes = 600 seconds.
-
-  With 10-second clips:
-  600 / 10 = 60 clips.
+  GENERATE VIDEO
 */
-app.post("/api/generate-10min", async (req, res) => {
+app.post("/api/generate", async (req, res) => {
   try {
     const {
-      prompt,
-      characterImage,
+      story,
       ratio = "1280:720"
     } = req.body;
 
-    if (!prompt) {
+    if (!story || !story.trim()) {
       return res.status(400).json({
-        error: "prompt is required"
+        success: false,
+        message: "Please provide a story."
       });
     }
 
-    if (!RUNWAY_API_KEY) {
+    if (!API_KEY) {
       return res.status(500).json({
-        error: "RUNWAYML_API_SECRET is missing on Render"
+        success: false,
+        message:
+          "Runway API key is not configured."
       });
     }
 
-    if (!RUNWAY_API_KEY.startsWith("key_")) {
-      return res.status(500).json({
-        error:
-          "Invalid Runway API key format. It must start with key_"
+    const allowedRatios = [
+      "1280:720",
+      "720:1280"
+    ];
+
+    if (!allowedRatios.includes(ratio)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid video ratio."
       });
     }
 
-    const clips = [];
+    const jobId = crypto.randomUUID();
 
-    const totalClips = 60;
-
-    console.log(
-      `Starting 10-minute generation: ${totalClips} clips`
-    );
-
-    for (let i = 0; i < totalClips; i++) {
-      console.log(
-        `Generating clip ${i + 1}/${totalClips}`
-      );
-
-      /*
-        Important:
-        The SAME characterImage is sent
-        to every generation.
-      */
-
-      const scenePrompt = `
-Maintain the exact same main character throughout the video.
-
-Character consistency:
-- same face
-- same hairstyle
-- same clothing
-- same body proportions
-- same overall appearance
-- same visual style
-
-Scene ${i + 1} of ${totalClips}.
-
-${prompt}
-
-Keep the character visually consistent with
-the provided reference image.
-Do not redesign or replace the character.
-`;
-
-      const videoUrl = await generateClip({
-        prompt: scenePrompt,
-        characterImage,
-        duration: 10,
-        ratio
-      });
-
-      const filename = path.join(
-        os.tmpdir(),
-        `veox-clip-${Date.now()}-${i}.mp4`
-      );
-
-      await downloadVideo(videoUrl, filename);
-
-      clips.push(filename);
-
-      console.log(
-        `Clip ${i + 1}/${totalClips} completed`
-      );
-    }
-
-    console.log("All clips generated.");
-    console.log("Merging clips...");
-
-    const finalFile = path.join(
-      os.tmpdir(),
-      `veox-final-${Date.now()}.mp4`
-    );
-
-    await mergeVideos(clips, finalFile);
-
-    console.log("Final 10-minute video created.");
-
-    res.json({
-      success: true,
-      duration: "10 minutes",
-      clips: clips.length,
-      video: `/api/video/${path.basename(finalFile)}`
+    jobs.set(jobId, {
+      id: jobId,
+      status: "starting",
+      progress: 0,
+      message:
+        "Starting AI video generation...",
+      videoUrl: null,
+      error: null,
+      createdAt: Date.now()
     });
 
-  } catch (error) {
-    console.error("Generation error:", error);
+    res.status(202).json({
+      success: true,
+      jobId,
+      message:
+        "Video generation started."
+    });
 
-    if (error instanceof TaskFailedError) {
-      return res.status(500).json({
-        error: "Runway generation failed"
-      });
-    }
+    generateFullVideo(
+      jobId,
+      story.trim(),
+      ratio
+    );
+
+  } catch (error) {
+    console.error(
+      "Generate request error:",
+      error
+    );
 
     res.status(500).json({
-      error: error.message || "Video generation failed"
+      success: false,
+      message:
+        error?.message ||
+        "Could not start video generation."
     });
   }
 });
 
 /*
-  Serve generated videos.
+  FULL VIDEO GENERATION
 */
-app.get("/api/video/:filename", (req, res) => {
-  const filename = path.basename(req.params.filename);
-  const filepath = path.join(os.tmpdir(), filename);
+async function generateFullVideo(
+  jobId,
+  story,
+  ratio
+) {
+  const job = jobs.get(jobId);
 
-  if (!fs.existsSync(filepath)) {
-    return res.status(404).json({
-      error: "Video not found"
+  if (!job) return;
+
+  const prompts =
+    createScenePrompts(story);
+
+  const clips = [];
+
+  try {
+    for (
+      let i = 0;
+      i < prompts.length;
+      i++
+    ) {
+      job.status = "generating";
+
+      job.progress = Math.round(
+        (i / prompts.length) * 85
+      );
+
+      job.message =
+        `Generating scene ${i + 1} of ${prompts.length}...`;
+
+      console.log(
+        `Generating scene ${i + 1}/${prompts.length}`
+      );
+
+      const clipFile = path.join(
+        os.tmpdir(),
+        `veox-${jobId}-scene-${i + 1}.mp4`
+      );
+
+      await generateClip(
+        prompts[i],
+        ratio,
+        clipFile
+      );
+
+      clips.push(clipFile);
+
+      job.progress = Math.round(
+        ((i + 1) / prompts.length) * 85
+      );
+    }
+
+    console.log(
+      "All clips generated."
+    );
+
+    job.status = "merging";
+    job.progress = 90;
+    job.message =
+      "Combining your scenes...";
+
+    console.log(
+      "Merging clips..."
+    );
+
+    const finalFile = path.join(
+      os.tmpdir(),
+      `veox-final-${jobId}.mp4`
+    );
+
+    await mergeVideos(
+      clips,
+      finalFile
+    );
+
+    console.log(
+      "Final 10-minute video created."
+    );
+
+    job.status = "completed";
+    job.progress = 100;
+    job.message =
+      "Your AI video is ready! 🎉";
+
+    job.videoUrl =
+      `/api/video/${path.basename(finalFile)}`;
+
+    for (const clip of clips) {
+      await fs.promises
+        .unlink(clip)
+        .catch(() => {});
+    }
+
+  } catch (error) {
+    console.error(
+      "Generation error:",
+      error
+    );
+
+    job.status = "failed";
+    job.progress = 0;
+
+    if (error instanceof TaskFailedError) {
+      job.error =
+        "Runway generation failed.";
+    } else {
+      job.error =
+        error?.message ||
+        "Video generation failed.";
+    }
+
+    for (const clip of clips) {
+      await fs.promises
+        .unlink(clip)
+        .catch(() => {});
+    }
+  }
+}
+
+/*
+  VIDEO FILE
+*/
+app.get(
+  "/api/video/:filename",
+  (req, res) => {
+    const filename =
+      path.basename(
+        req.params.filename
+      );
+
+    const filepath =
+      path.join(
+        os.tmpdir(),
+        filename
+      );
+
+    if (!fs.existsSync(filepath)) {
+      return res.status(404).json({
+        error: "Video not found"
+      });
+    }
+
+    res.sendFile(filepath);
+  }
+);
+
+/*
+  JOB STATUS
+*/
+app.get(
+  "/api/status/:jobId",
+  (req, res) => {
+    const job =
+      jobs.get(
+        req.params.jobId
+      );
+
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        message: "Job not found."
+      });
+    }
+
+    res.json({
+      success: true,
+      job
     });
   }
+);
 
-  res.sendFile(filepath);
-});
+/*
+  404
+*/
+app.use(
+  (req, res) => {
+    res.status(404).json({
+      success: false,
+      message:
+        "VEOX AI endpoint not found.",
+      path: req.originalUrl
+    });
+  }
+);
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`VEOX AI running on port ${PORT}`);
+/*
+  START SERVER
+*/
+app.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
+    console.log(
+      `VEOX AI running on port ${PORT}`
+    );
 
-  console.log(
-    "Runway configured:",
-    !!RUNWAY_API_KEY &&
-    RUNWAY_API_KEY.startsWith("key_")
-  );
-});
+    console.log(
+      `Runway configured: ${Boolean(API_KEY)}`
+    );
+  }
+);
